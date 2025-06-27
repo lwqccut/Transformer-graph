@@ -1,1 +1,704 @@
+from pathlib import Path
+import random
+import pandas as pd
+import numpy as np
+import cv2
+from sklearn.cluster import KMeans
+from sklearn.model_selection import train_test_split
+import torch
+import os
 
+
+def generate_img_feature(data, fov, margin, root_path):
+
+    data_fov = data[data['fov'] == fov]#根据fov进行筛选
+    data_fov = data_fov.reset_index(drop=True)  # 重置索引并保证旧的索引直接丢弃而不是作为新列
+
+
+
+    # x和y在CSV中是反转的，所以反转赋值
+    #对数据集进行过滤，提取坐标信息
+    x = data_fov['CenterY_local_px']
+    y = data_fov['CenterX_local_px']
+
+    '''big_img = cv2.imread(os.path.join(root_path, 'CellComposite/CellComposite_F{}.jpg').format(str(fov).zfill(3)))
+    # zfill(l) 在字符串左侧添加0以使其达到指定的长度l
+    try:
+        imgs = [big_img[x[i] - margin:x[i] + margin, y[i] - margin:y[i] + margin] for i in range(len(x))]
+
+    except Exception as e:  # python 中:except Exception as e"可以捕获异常
+        imgs = []
+        for i in range(len(x)):
+            img = big_img[x[i] - margin:x[i] + margin, y[i] - margin:y[i] + margin]
+            if img.shape[0] < 2 * margin or img.shape[1] < 2 * margin:
+                pad_height = max(2 * margin - img.shape[0], 0)
+                pad_width = max(2 * margin - img.shape[1], 0)
+                img = np.pad(img, ((0, pad_height), (0, pad_width), (0, 0)), mode='constant')
+            imgs.append(img)
+        imgs = np.stack(imgs)
+        print('///////////////////////////////////////')'''
+    imgs = []
+    return imgs, [x, y]
+
+
+label_map = {'tumors': 0, 'fibroblast': 1, 'lymphocyte': 2, 'Mcell': 3, 'neutrophil': 4, 'endothelial': 5,
+             'epithelial': 6, 'mast': 7}#label_map将类别名称转换为标签，以便模型可以更容易地进行训练和预测，相当于映射。
+
+
+def load_Nano_data(id, labeled_ratio=0.3, anchor_ratio=0.1, split_mode='random', margin=16, root_path='./'):
+    data = pd.read_csv(os.path.join(root_path, 'all_in_one.csv'))#通过 pd.read_csv 读取位于 root_path 路径下的 all_in_one.csv 文件。该文件似乎包含了与细胞和基因相关的数据。
+    gene_feature_col = pd.read_csv(os.path.join(root_path, 'Lung9_Rep1_exprMat_file.csv')).columns[
+                       2:]  # 980 gene-related features
+                             #读取 Lung9_Rep1_exprMat_file.csv 文件，并提取从第三列开始的所有基因相关特征列。
+
+    if data is None:
+        data = pd.read_csv('all_in_one.csv')#从all_in_one.csv中提取坐标数据
+    elif type(data) == str:
+        data = pd.read_csv(data)
+        #检查 data 是否为空（None）或是否为字符串路径。如果是字符串路径，它会从指定路径加载 CSV 文件。这样可以使得该函数更灵活地处理不同的输入类型。
+
+
+    data_fov = data[data['fov'] == id]
+    data_fov = data_fov.reset_index(drop=True)  # 每次根据ID筛选排列数据，根据新的索引提取数据
+    #这两行代码的作用是从一个 Pandas 的 DataFrame 对象 data 中筛选出 fov 列的值等于指定 id 的所有行，然后对筛选出的这些行重新设置索引。
+
+
+    # the x and y are reversed in the csv file，坐标修正。csv坐标是倒转的
+    x = data_fov['CenterY_local_px']
+    y = data_fov['CenterX_local_px']
+
+    spatial_loc = [x, y]#存储空间坐标
+
+    # patchs, spatial_loc = generate_img_feature(data, id, margin, root_path)
+
+    gt = data[data['fov'] == id]['cell_type']  # the cell type is string type，通过 fov 筛选出指定视场角的细胞类型（cell_type）。这些标签是字符串类型（如“tumors”、“fibroblast”等）。
+    gt = gt.map(label_map).to_numpy()  # map函数，使用 label_map 字典将这些细胞类型字符串映射到对应的数字标签，最后将其转换为 NumPy 数组。
+
+    gene_fea = data[data['fov'] == id][gene_feature_col].to_numpy().astype(float)
+    #空间位置信息处理完后，提取与当前 fov 相关的基因特征数据，将其转换为 NumPy 数组，并确保数据类型为浮动类型（float）。
+
+    labeled_idx, unlabeled_idx, anchors, positives, negatives = split_labeled_data(gene_fea, gt, spatial_loc, 
+                                                                                    labeled_ratio=labeled_ratio,
+                                                                                    anchor_ratio=anchor_ratio, 
+                                                                                    fov=id, seed=42,
+                                                                                    split_mode=split_mode, top_k=20)
+    #调用 split_labeled_data 函数将数据拆分成标注数据（labeled_idx）、未标注数据（unlabeled_idx）、锚点（anchors）、正样本（positives）和负样本（negatives）。
+    #该函数使用传入的参数来确定拆分比例以及拆分方式（例如，随机拆分或其他模式）
+    '''labeled_ratio: 标注样本的比例。
+       anchor_ratio: 锚点样本的比例。
+       split_mode: 数据拆分模式（如随机或其他）。
+       top_k: 在某些情况下可能用于选择前 K 个样本。
+    '''
+
+
+    #输出样本信息
+    print(f"Number of labeled samples: {len(labeled_idx)}")#有标签样本数
+    print(f"Number of unlabeled samples: {len(unlabeled_idx)}")#无标签样本数
+    print(f"Total number of samples: {len(gt)}")#总样本数
+    print(f"Number of anchors: {len(anchors)}")  # 锚点
+    print(f"Number of positives: {len(positives)}")  # 正样本
+    print(f"Number of negatives: {len(negatives)}")  # 负样本
+    '''空间坐标处理
+    空间坐标 (x, y) 从 CSV 读取，(x, y) 交换修正
+    存储为 numpy 结构 (spatial_loc = np.column_stack((x, y)))
+    构造空间网格 (gt[x, y] = label)，方便 disjoint 拆分
+    用于 anchor/positive/negative 计算（基于空间最近邻）
+    '''
+
+    x, y = spatial_loc[0], spatial_loc[1]
+    spatial_loc = np.column_stack((x, y))#将之前提取的 x 和 y 坐标重新合并成一个二维数组 spatial_loc，这样每个位置都有一对 (x, y) 坐标。
+
+    return gene_fea, gt, spatial_loc, labeled_idx, unlabeled_idx, anchors, positives, negatives
+
+
+def split_labeled_data(gene_fea, labels, spatial_loc, labeled_ratio=0.3, anchor_ratio=0.1, fov=1, seed=1024,
+                       split_mode='disjoint', top_k=20):#这是一个特定的字段，用来过滤数据集，通常是图像中的某个区域或者不同的实验批次。它用于指明从哪些视场角的数据中提取样本。
+    #split_mode (拆分模式):'disjoint'：数据被完全划分为不同的子集，没有交集（比如训练集和测试集）。'random'：随机拆分数据集。
+    """
+    Split the dataset into labeled and unlabeled data using the 'disjoint' method.
+
+    Parameters
+    ----------
+    data : ndarray
+        The entire dataset.
+    labels : ndarray
+        The labels for the entire dataset.
+    spatial_loc : ndarray
+        The spatial locations for each sample.
+    labeled_ratio : float, optional
+        Ratio of samples to retain labels. The other samples' labels are all hidden.
+    seed : int, optional
+        Random seed for reproducibility.
+    split_mode : str, optional
+        The splitting mode. Currently only 'disjoint' is implemented.
+    fov : int fov id
+
+    Returns
+    -------
+    labeled_data : ndarray
+        The labeled portion of the dataset.
+    labeled_labels : ndarray
+        The labels for the labeled portion of the dataset.
+    unlabeled_train_data : ndarray
+        The unlabeled training portion of the dataset.
+    unlabeled_test_data : ndarray
+        The unlabeled testing portion of the dataset.
+    """
+
+    # 定义文件路径
+    #这行代码通过 os.path.join 函数生成一个路径字符串。
+    base_path = os.path.join('../../SC/Nanostring/', 'Samples', 'split_model_{}_ldr_{}_anc_{}_seed_{}'.format(split_mode, labeled_ratio, anchor_ratio, seed),
+                             'fov_' + str(fov))
+    all_samples_path = os.path.join(base_path, 'selected_samples_all.csv')
+    #该文件包含样本的标注（labeled）与未标注（unlabeled）信息。
+    anchor_positive_negative_path = os.path.join(base_path, 'triplet_indices.csv')
+    #anchor_positive_negative_path: 该路径指向保存锚点、正样本和负样本索引的 CSV 文件 triplet_indices.csv。这些信息在度量学习或三元组学习中通常非常重要，涉及锚点（anchor）、正样本（positive）和负样本（negative）。
+    # anchor_positive_negative_path = os.path.join(base_path, 'new_anchor_positive_negative.csv')
+
+
+    labels = labels + 1
+
+    if os.path.exists(all_samples_path) and os.path.isfile(anchor_positive_negative_path):
+        #all_samples_path: 样本文件（selected_samples_all.csv）是否存在。anchor_positive_negative_path: 锚点文件（triplet_indices.csv）是否存在。
+        df = pd.read_csv(all_samples_path)
+        #通过 pd.read_csv 加载 selected_samples_all.csv 文件到 DataFrame df 中。
+        labeled_idx = df[df['selected'] == 'labeled'].index.tolist()
+        unlabeled_idx = df[df['selected'] == 'unlabeled'].index.tolist()
+        #筛选出标注样本和未标注样本的索引，并将它们分别存储在 labeled_idx 和 unlabeled_idx 列表中
+
+        apn_df = pd.read_csv(anchor_positive_negative_path)
+        #读取 triplet_indices.csv 文件，并将其加载为 DataFrame apn_df
+        anchors = apn_df['anchor'].tolist()
+        #提取 DataFrame 中 anchor 列的数据，转换为列表，存储在 anchors 中。
+        positives = apn_df['positive'].tolist()
+        #提取 positive 列的数据，存储在 positives 中。
+        negatives = apn_df['negative'].tolist()
+        #提取 negative 列的数据，存储在 negatives 中。
+
+        return labeled_idx, unlabeled_idx, anchors, positives, negatives
+        #最后返回 labeled_idx、unlabeled_idx、anchors、positives 和 negatives。
+
+    np.random.seed(seed)
+    random.seed(seed)#用于设置 NumPy 和 Python 内建的随机数生成器的种子，以保证代码的可复现性。
+
+
+
+    # 创建gt
+    x_max, y_max = spatial_loc[0].max() + 1, spatial_loc[1].max() + 1
+    #gt = -1 * np.ones((x_max, y_max), dtype=int)
+    x_max = np.nan_to_num(x_max, nan=0)  # 如果是NaN，则将其替换为0,修改
+    y_max = np.nan_to_num(y_max, nan=0)  # 如果是NaN，则将其替换为0，修改
+
+    gt = -1 * np.ones((int(x_max), int(y_max)), dtype=int)
+    # 创建一个大小为 (x_max, y_max) 的网格，并用 -1 填充，表示初始状态下所有位置都没有标签。
+    for idx, xy in enumerate(zip(spatial_loc[0], spatial_loc[1])):
+        #根据 spatial_loc 和 labels 的信息，将标签（labels[idx]）放入相应的空间位置（xy[0], xy[1]）对应的网格位置。
+        gt[xy[0], xy[1]] = labels[idx]#后面将根据标签将数据注入训练和测试图中222和224行train_gt,test_gt
+    for idx, xy in enumerate(zip(spatial_loc[0], spatial_loc[1])):
+        gt[xy[0], xy[1]] = labels[idx]
+
+    unique_labels = np.unique(labels)
+
+    # 保存数据索引
+    labeled_idx, unlabeled_idx = [], []
+    #根据 split_mode 的不同，代码通过不同策略将样本分为标注样本（labeled）和未标注样本（unlabeled）。
+    if split_mode == 'random':#主要使用的样本划分模型，随机分割，对每个标签的样本位置进行随机划分，使用 train_test_split 函数将数据分为训练集和测试集。
+        for label in unique_labels:
+            X = np.where(gt == label)
+            X = list(zip(*X))  # 将索引转换为列表形式
+
+            train_gt = np.zeros_like(gt)
+            #train_gt 和 test_gt 将用于分别存储训练集和测试集的位置（标签）。
+            test_gt = np.zeros_like(gt)
+            #创建两个与 gt 同样大小的网格 train_gt 和 test_gt，并初始化为全零。gt 是之前计算的标注网格，表示空间位置上的标签。
+
+            train_indices, test_indices = train_test_split(X, train_size=(labeled_ratio), random_state=seed)
+            #使用 train_test_split 函数将 X（标签为某个特定值的空间位置索引）划分为训练集和测试集。
+            #train_size=(labeled_ratio)：指定训练集所占比例，通过 labeled_ratio 控制（即标注样本的比例）。
+
+            train_indices = [list(t) for t in zip(*train_indices)]
+            #train_indices 和 test_indices 在 train_test_split 后是一个包含索引的数组。zip(*train_indices) 是将这些索引转换为元组形式，然后将每个元组转为列表。
+            test_indices = [list(t) for t in zip(*test_indices)]
+            #这样做的目的是将一维的 train_indices 和 test_indices 转换为可以用作数组索引的形式。
+
+            train_gt[tuple(train_indices)] = gt[tuple(train_indices)]
+            #将 train_indices 和 test_indices 对应位置的标签从 gt 复制到 train_gt 和 test_gt 中。即在训练集和测试集的网格中分别标记出哪些位置属于训练集，哪些属于测试集。
+            test_gt[tuple(test_indices)] = gt[tuple(test_indices)]
+            #tuple(train_indices) 和 tuple(test_indices) 将列表索引转换为元组形式，方便用作 NumPy 数组的索引。
+
+            for idx, xy in enumerate(zip(spatial_loc[0], spatial_loc[1])):
+                if train_gt[xy[0], xy[1]] != 0:
+                    #如果该位置在 train_gt 中的值不为零，说明该位置属于训练集（标注样本），则将该位置的索引 idx 添加到 labeled_idx 列表中。
+                    labeled_idx.append(idx)
+                elif test_gt[xy[0], xy[1]] != 0:
+                    #如果该位置在 test_gt 中的值不为零，说明该位置属于测试集（未标注样本），则将该位置的索引 idx 添加到 unlabeled_idx 列表中。
+                    unlabeled_idx.append(idx)
+
+    elif split_mode == 'disjoint':  #在空间上尽量远离，该策略通过空间位置将标注样本尽量分散在不同区域，使得训练集和测试集中的样本尽量不重叠。
+        train_gt = np.copy(gt)
+        test_gt = np.copy(gt)
+        #创建 train_gt 和 test_gt，它们是 gt（原始标注网格）的副本。train_gt 和 test_gt 将分别存储训练集和测试集样本的位置标签
+        unique_labels = np.unique(labels)
+        #获取 labels 数组中的所有唯一标签，这些标签代表不同类别的样本。
+
+        for label in unique_labels:
+            mask = gt == label
+            #对于每个标签，创建一个布尔 mask，它将标记出所有属于当前标签的空间位置，mask 中的 True 表示这些位置属于当前标签。
+            for x in range(gt.shape[0]):
+                first_half_count = np.count_nonzero(mask[:x, :])#将标签的样本分成前半部分和后半部分
+                second_half_count = np.count_nonzero(mask[x:, :])
+                try:
+                    ratio = first_half_count / second_half_count
+                    if 0.9 * labeled_ratio < ratio < 1.1 * labeled_ratio:
+                        break
+                except ZeroDivisionError:#如果 first_half_count 和 second_half_count 的比例在 0.9 * labeled_ratio 到 1.1 * labeled_ratio 之间，表示分割点合理，满足平衡要求，然后退出循环（break）
+                    continue
+            mask[:x, :] = 0
+            train_gt[mask] = 0
+
+        test_gt[train_gt > 0] = 0#在 test_gt 中将所有属于训练集（train_gt > 0）的样本标记为 0，即移除测试集中的这些位置，避免它们成为测试集样本。
+
+        for idx, xy in enumerate(zip(spatial_loc[0], spatial_loc[1])):
+            #如果该位置在 train_gt 中的值不为 0，则该位置属于训练集（标注样本），将其索引 idx 添加到 labeled_idx 列表中。
+            if train_gt[xy[0], xy[1]] != 0:
+                labeled_idx.append(idx)
+            elif test_gt[xy[0], xy[1]] != 0:#如果该位置在 test_gt 中的值不为 0，则该位置属于测试集（未标注样本），将其索引 idx 添加到 unlabeled_idx 列表中。
+                unlabeled_idx.append(idx)
+
+    elif split_mode == 'clustered':#使用 KMeans 聚类算法对每个标签的样本进行聚类，并根据聚类结果将样本分为标注和未标注两部分。
+        for label in unique_labels:#遍历所有唯一标签 unique_labels，每个 label 代表一个类别。
+            label_indices = np.where(labels == label)[0]
+
+            #返回所有 labels 中等于当前 label 的索引。[0] 选择的是索引数组的第一个维度，即所有该标签对应的样本的索引。
+            label_gt = gt[:, label_indices].T
+
+            #这行代码从 gt 数组中提取出该标签的地面真实值数据。label_indices 选出的样本的列索引，gt[:, label_indices] 就会返回所有这些样本的相关特征值，然后 .T 做转置操作，以确保 label_gt 的形状适用于后续的 KMeans 聚类操作
+            kmeans = KMeans(n_clusters=1, random_state=seed)
+            #这里使用 KMeans 算法进行聚类。n_clusters=1 表示只用一个簇来拟合这些样本的特征，这相当于计算这些样本的质心（均值）。random_state=seed 确保了每次运行时结果是相同的，保证实验的可重复性。
+            kmeans.fit(label_gt)
+
+            centroid = kmeans.cluster_centers_[0]
+            #np.linalg.norm 用来计算每个样本到质心的欧几里得距离。label_gt - centroid 会得到每个样本与质心的差值，然后对差值进行 axis=1 的范数计算，即每一行（每个样本）与质心的距离。
+            distances = np.linalg.norm(label_gt - centroid, axis=1)
+            #num_labeled 计算出根据 labeled_ratio 这个比例应该有多少个样本被标注。labeled_idx 会被扩展（extend）为从 sorted_indices 中选择的前 num_labeled 个样本（即离质心最近的样本）。而 unlabeled_idx 会扩展为剩下的未被标注的样本（即离质心较远的样本）。
+
+            #num_labeled 计算出根据 labeled_ratio 这个比例应该有多少个样本被标注。labeled_idx 会被扩展（extend）为从 sorted_indices 中选择的前 num_labeled 个样本（即离质心最近的样本）。而 unlabeled_idx 会扩展为剩下的未被标注的样本（即离质心较远的样本）。
+            sorted_indices = label_indices[np.argsort(distances)]
+            num_labeled = int(len(label_indices) * labeled_ratio)
+            labeled_idx.extend(sorted_indices[:num_labeled])
+
+            #通过 extend() 方法，当前标签下的标注样本索引 labeled_idx 和未标注样本索引 unlabeled_idx 被分别更新
+            unlabeled_idx.extend(sorted_indices[num_labeled:])
+
+    else:
+        raise ValueError(f"{split_mode} sampling is not implemented yet.")
+    
+    anchors, positives, negatives = [], [], []
+
+    unique_labels = np.unique(labels[labeled_idx])
+
+    for label in unique_labels:
+        # 选择当前类中的labeled节点
+        labeled_idx_label = np.array(labeled_idx)
+        class_idx = labeled_idx_label[labels[labeled_idx] == label]
+        #class_idx 是当前细胞类型的所有标注节点的索引列表。
+        #labels[labeled_idx] == label 用来选择当前细胞类型的所有已标注节点。
+        #labeled_idx 是所有已标注节点的索引列表。
+
+        # 随机选择一部分有labeled 数据作为 anchors
+        num_anchors_to_select = int(len(class_idx) * anchor_ratio)  # 例如，选择10%的labeled数据作为anchors
+        selected_anchors = np.random.choice(class_idx, size=num_anchors_to_select, replace=False)
+
+        for anchor in selected_anchors:
+            # 计算与该锚点距离最远的top_k个同类节点
+            anchor_loc = np.array([spatial_loc[0][anchor], spatial_loc[1][anchor]])
+            same_class_idx = np.array([idx for idx in range(len(labels)) if labels[idx] == label and idx != anchor])
+            same_class_loc = np.array([[spatial_loc[0][idx], spatial_loc[1][idx]] for idx in same_class_idx])
+
+            distances = np.linalg.norm(same_class_loc - anchor_loc, axis=1)
+            top_k_distant_idx = same_class_idx[np.argsort(distances)[-top_k:]]
+
+            # 从 top_k_distant_idx 中选择基因表达最相似的节点作为正样本，计算基因表达向量之间的余弦相似度（通过矩阵点积），选择相似度最高的节点。
+            positive_idx = top_k_distant_idx[np.argmax(np.dot(gene_fea[top_k_distant_idx], gene_fea[anchor]))]
+
+            # 找到离当前正样本最近的其它节点，且基因表达最相似的节点作为负样本
+            positive_loc = np.array([spatial_loc[0][positive_idx], spatial_loc[1][positive_idx]])
+            different_class_idx = np.array([idx for idx in range(len(labels)) if labels[idx] != label])
+            different_class_loc = np.array([[spatial_loc[0][idx], spatial_loc[1][idx]] for idx in different_class_idx])
+            distances_to_positive = np.linalg.norm(different_class_loc - positive_loc, axis=1)
+            closest_negative_candidates = different_class_idx[np.argsort(distances_to_positive)[:top_k]]
+
+            # 从这些候选负样本中选择基因表达最相似的节点作为负样本
+            negative_idx = closest_negative_candidates[np.argmax(np.dot(gene_fea[closest_negative_candidates], gene_fea[anchor]))]
+
+            #将当前选择的锚点、正样本和负样本分别添加到 anchors、positives 和 negatives 列表中
+            anchors.append(anchor)
+            positives.append(positive_idx)
+            negatives.append(negative_idx)
+
+    # 保存数据和索引为 CSV 文件
+    df = pd.DataFrame({
+        'cell_type': labels,
+        'x': spatial_loc[0],
+        'y': spatial_loc[1],
+        'selected': ['labeled' if i in labeled_idx else 'unlabeled' for i in range(len(labels))],
+    })
+
+    Path(base_path).mkdir(parents=True, exist_ok=True)
+    df.to_csv(all_samples_path, index=False)
+
+    for label in unique_labels:#遍历所有唯一的细胞类型
+        label_df = df[df['cell_type'] == label]#选择给定类别的所有样本
+        label_df.to_csv(#保存为csv文件
+            os.path.join(base_path, f'selected_samples_label_{label}.csv'),
+            index=False)#不保存索引
+    
+    apn_df = pd.DataFrame({
+        'anchor': anchors,
+        'positive': positives,
+        'negative': negatives
+    })
+
+    apn_df.to_csv(anchor_positive_negative_path, index=False)
+
+    return labeled_idx, unlabeled_idx, anchors, positives, negatives
+
+
+# # 保证train_size至少为1个样本
+# def safe_train_test_split(X, labeled_ratio, seed=42):
+#     n_samples = len(X)
+#     # 确保至少有1个样本被分配到训练集中
+#     min_train_size = 1 / n_samples
+#     labeled_ratio = max(labeled_ratio, min_train_size)
+
+#     train_indices, test_indices = train_test_split(X, train_size=labeled_ratio, random_state=seed)
+    
+#     return train_indices, test_indices
+
+def select_hvg_by_variance(gene_fea, top_n=2000):
+    """
+    根据方差选择高变异基因（HVG）
+    
+    Parameters:
+    ----------
+    gene_fea : ndarray
+        基因表达特征矩阵，行是样本，列是基因。
+    top_n : int, optional
+        要选择的HVG数量。
+        
+    Returns:
+    -------
+    hvg_genes : ndarray
+        表示高变异基因索引的数组。
+    """
+    # 计算每个基因的方差
+    variances = np.var(gene_fea, axis=0)
+    
+    # 选择方差最大的top_n个基因
+    hvg_genes = np.argsort(variances)[-top_n:]
+    
+    return hvg_genes
+
+def save_or_load_hvg_records(gene_fea, top_n_hvg=2000, hvg_record_path='./hvg_records/hvg_genes.csv'):
+    """
+    选择高变异基因（HVG）并保存或加载之前的记录
+    
+    Parameters:
+    ----------
+    gene_fea : ndarray
+        基因表达特征矩阵，行是样本，列是基因。
+    top_n_hvg : int, optional
+        要选择的HVG数量。
+    hvg_record_path : str, optional
+        HVG记录的保存路径。
+        
+    Returns:
+    -------
+    hvg_genes : ndarray
+        表示高变异基因索引的数组。
+    hvg_record_df : pd.DataFrame
+        HVG记录的DataFrame，方便后续可视化分析。
+    """
+    # 如果文件存在，直接读取
+    if os.path.exists(hvg_record_path):
+        print(f"Loading existing HVG records from {hvg_record_path}")
+        hvg_record_df = pd.read_csv(hvg_record_path)
+        hvg_genes = hvg_record_df['hvg_index'].values
+    else:
+        # 选择高变异基因并保存记录
+        print(f"Selecting HVGs and saving records to {hvg_record_path}")
+        hvg_genes = select_hvg_by_variance(gene_fea, top_n=top_n_hvg)
+        hvg_record_df = pd.DataFrame({
+            'hvg_index': hvg_genes
+        })
+        
+        # 创建目录并保存记录
+        hvg_record_dir = os.path.dirname(hvg_record_path)
+        Path(hvg_record_dir).mkdir(parents=True, exist_ok=True)
+        hvg_record_df.to_csv(hvg_record_path, index=False)
+    
+    return hvg_genes, hvg_record_df
+
+def split_labeled_data_v2(gene_fea, labels, spatial_loc, labeled_ratio=0.3, anchor_ratio=0.1,
+                          fov=1, seed=1024, split_mode='disjoint', top_k=20, top_n_hvg=2000):
+    """
+    根据指定的split_mode对数据进行切分，并生成anchor、positive、negative三元组。
+
+    Parameters
+    ----------
+    gene_fea : ndarray
+        基因表达特征矩阵。
+    labels : ndarray
+        数据集中的标签。
+    spatial_loc : ndarray
+        样本的空间位置信息。
+    labeled_ratio : float, optional
+        需要标注的数据比例。其他样本的标签将被隐藏。
+    anchor_ratio : float, optional
+        锚点(anchor)选择的比例。
+    fov : int
+        视场编号。
+    seed : int, optional
+        随机种子，确保结果的可重复性。
+    split_mode : str, optional
+        数据划分模式，包括 'random', 'disjoint', 'clustered'。
+    top_k : int, optional
+        用于选择正样本的距离最近节点数量。
+    top_n_hvg : int, optional
+        高变异基因数量。
+
+    Returns
+    -------
+    labeled_idx : list
+        标注样本的索引列表。
+    unlabeled_idx : list
+        未标注样本的索引列表。
+    anchors : list
+        锚点样本的索引列表。
+    positives : list
+        正样本的索引列表。
+    negatives : list
+        负样本的索引列表。
+    """
+
+    # 定义文件路径,加载数据
+    base_path = os.path.join(
+        '../../SC/Nanostring/', 'Samples',
+        'split_model_{}_ldr_{}_anc_{}_{}_seed_{}'.format(
+            split_mode, labeled_ratio, anchor_ratio, 'hvg', seed),
+        'fov_' + str(fov)
+    )
+    all_samples_path = os.path.join(base_path, 'selected_samples_all.csv')
+    anchor_positive_negative_path = os.path.join(base_path, 'triplet_indices.csv')
+    hvg_path = os.path.join(base_path, 'hvg_genes.csv')
+
+    labels = labels + 1  # 调整标签以避免从0开始
+    #读取两个 CSV 文件，分别获取标记和未标记的样本索引，以及锚点、正例和负例的数据
+    # 检查文件是否已经存在
+    if os.path.exists(all_samples_path) and os.path.isfile(anchor_positive_negative_path):
+        df = pd.read_csv(all_samples_path)#用 pandas 库的 read_csv 函数读取路径 all_samples_path 对应的 CSV 文件，并将其内容加载到 DataFrame df 中。
+        labeled_idx = df[df['selected'] == 'labeled'].index.tolist()#从 DataFrame df 中，筛选出 selected 列值为 'labeled' 的行，然后获取这些行的索引，并将索引转化为列表形式存入 labeled_idx 变量。
+        unlabeled_idx = df[df['selected'] == 'unlabeled'].index.tolist()#从 DataFrame df 中，筛选出 selected 列值为 'unlabeled' 的行，获取这些行的索引，并转化为列表形式存入 unlabeled_idx 变量。
+
+        apn_df = pd.read_csv(anchor_positive_negative_path)#用 pandas 的 read_csv 函数读取路径 anchor_positive_negative_path 对应的 CSV 文件，并将内容加载到 DataFrame apn_df 中。
+        anchors = apn_df['anchor'].tolist()#用 pandas 的 read_csv 函数读取路径 anchor_positive_negative_path 对应的 CSV 文件，并将内容加载到 DataFrame apn_df 中。
+        positives = apn_df['positive'].tolist()#从 DataFrame apn_df 中提取出 positive 列的所有数据，并将其转换成列表形式存入 positives 变量。
+        negatives = apn_df['negative'].tolist()#从 DataFrame apn_df 中提取出 negative 列的所有数据，并将其转换成列表形式存入 negatives 变量
+
+        return labeled_idx, unlabeled_idx, anchors, positives, negatives
+
+    np.random.seed(seed)
+    random.seed(seed)
+
+    # 创建gt，np是数组的意思
+    x_max, y_max = spatial_loc[0].max() + 1, spatial_loc[1].max() + 1#spatial_loc[0] 和 spatial_loc[1] 分别代表空间位置的 x 和 y 坐标，这一行代码通过取它们的最大值（max()），分别得到 x 和 y 坐标轴的最大值，然后加 1，确保能为所有可能的坐标位置创建一个足够大的网格（数组）。
+    gt = -1 * np.ones((x_max, y_max), dtype=int)#这行代码创建了一个大小为 (x_max, y_max) 的二维数组 gt，其中所有的值初始化为 -1。这里使用 np.ones() 创建了一个全 1 的数组，然后乘以 -1 得到全为 -1 的数组。dtype=int 表示数组的数据类型是整数。
+    for idx, xy in enumerate(zip(spatial_loc[0], spatial_loc[1])):#这个循环遍历 spatial_loc[0] 和 spatial_loc[1] 中的坐标对，zip() 会将两个数组按元素配对，生成一个 (x, y) 坐标对的迭代器。enumerate() 会给出每个坐标对的索引（idx）和对应的坐标（xy）
+        gt[xy[0], xy[1]] = labels[idx]#对于每个坐标对 xy，根据索引 idx，将 labels[idx]（即标签）赋值给 gt 数组的对应位置（xy[0] 和 xy[1]）。这一步就是把空间位置对应的标签填入 gt 数组。
+
+    unique_labels = np.unique(labels)#np.unique(labels) 用来返回 labels 数组中唯一的标签值，并将它们存储在 unique_labels 变量中
+
+    # 保存数据索引
+    labeled_idx, unlabeled_idx = [], []
+
+    if split_mode == 'random':
+        for label in unique_labels:
+            X = np.where(gt == label)#np.where(gt == label) 返回 gt 数组中所有值为当前标签（label）的坐标位置，返回的 X 是一个包含 x 和 y 坐标的元组
+            X = list(zip(*X))  # 将索引转换为列表形式
+
+            train_gt = np.zeros_like(gt)#创建一个与 gt 大小相同、元素全为 0 的数组 train_gt，用于存储训练集标签。
+            test_gt = np.zeros_like(gt)#创建一个与 gt 大小相同、元素全为 0 的数组 test_gt，用于存储测试集标签。
+            #调用 train_test_split 函数将 X 中的坐标随机分为训练集和测试集。train_size=labeled_ratio 表示训练集的比例，random_state=seed 用于设置随机种子，保证结果可重复
+            train_indices, test_indices = train_test_split(X, train_size=(labeled_ratio), random_state=seed)
+
+
+            train_indices = [list(t) for t in zip(*train_indices)]#train_indices 返回的是 x 和 y 坐标的两个数组，这里将它们转为列表形式并将其打包成 (x, y) 坐标对。
+            test_indices = [list(t) for t in zip(*test_indices)]#test_indices 同样将 x 和 y 坐标的数组转为列表形式，并打包成坐标对。
+            #zip打包
+
+            train_gt[tuple(train_indices)] = gt[tuple(train_indices)]#将训练集的坐标位置（train_indices）在 train_gt 中对应的区域赋值为 gt 中对应的标签值。也就是将原始标签图中的训练集标签复制到训练集图中。
+
+            test_gt[tuple(test_indices)] = gt[tuple(test_indices)]#将测试集的坐标位置（test_indices）在 test_gt 中对应的区域赋值为 gt 中对应的标签值。也就是将原始标签图中的测试集标签复制到测试集图中。
+
+            for idx, xy in enumerate(zip(spatial_loc[0], spatial_loc[1])):
+                if train_gt[xy[0], xy[1]] != 0:
+                    labeled_idx.append(idx)#如果该坐标属于训练集，将该坐标的索引 idx 添加到 labeled_idx 列表中，表示这是一个标记样本。
+                    #apapend加入元素
+                elif test_gt[xy[0], xy[1]] != 0:
+                    unlabeled_idx.append(idx)#如果该坐标属于测试集，将该坐标的索引 idx 添加到 unlabeled_idx 列表中，表示这是一个未标记样本。
+
+    elif split_mode == 'disjoint':  # 在空间上尽量远离
+        train_gt = np.copy(gt)#创建一个与 gt 相同的副本 train_gt，它将用于存储训练集的标签。使用 np.copy() 来确保 train_gt 是 gt 的一个独立副本，修改 train_gt 时不会影响到 gt。
+        test_gt = np.copy(gt)#同样，创建一个与 gt 相同的副本 test_gt，它将用于存储测试集的标签。和 train_gt 一样，使用 np.copy() 来确保它是 gt 的独立副本。
+        unique_labels = np.unique(labels)#获取 labels 数组中的所有唯一标签值，并将其存储在 unique_labels 变量中。此步骤为后续的处理做准备。
+
+        for label in unique_labels:
+            mask = gt == label
+            for x in range(gt.shape[0]):
+                first_half_count = np.count_nonzero(mask[:x, :])
+                second_half_count = np.count_nonzero(mask[x:, :])
+                try:
+                    ratio = first_half_count / second_half_count
+                    if 0.9 * labeled_ratio < ratio < 1.1 * labeled_ratio:
+                        break
+                except ZeroDivisionError:
+                    continue
+            mask[:x, :] = 0
+            train_gt[mask] = 0
+
+        test_gt[train_gt > 0] = 0
+
+        for idx, xy in enumerate(zip(spatial_loc[0], spatial_loc[1])):
+            if train_gt[xy[0], xy[1]] != 0:
+                labeled_idx.append(idx)
+            elif test_gt[xy[0], xy[1]] != 0:
+                unlabeled_idx.append(idx)
+
+    elif split_mode == 'clustered':
+        for label in unique_labels:
+            label_indices = np.where(labels == label)[0]
+            label_gt = gt[:, label_indices].T
+
+            kmeans = KMeans(n_clusters=1, random_state=seed)
+            kmeans.fit(label_gt)
+            centroid = kmeans.cluster_centers_[0]
+
+            distances = np.linalg.norm(label_gt - centroid, axis=1)
+
+            sorted_indices = label_indices[np.argsort(distances)]
+            num_labeled = int(len(label_indices) * labeled_ratio)
+            labeled_idx.extend(sorted_indices[:num_labeled])
+            unlabeled_idx.extend(sorted_indices[num_labeled:])
+
+    else:
+        raise ValueError(f"{split_mode} sampling is not implemented yet.")
+
+    # 加载或选择HVG
+    hvg_genes, hvg_record_df = save_or_load_hvg_records(
+        gene_fea, top_n_hvg=top_n_hvg, hvg_record_path=hvg_path
+    )
+
+    anchors = []
+    positives = []
+    negatives = []
+    hvg_ratios = {}  # 记录每个标签的实际hvg比例
+
+    for label in unique_labels:
+        # 获取当前标签的样本索引
+        class_idx = np.array(labeled_idx)[labels[labeled_idx] == label]
+        class_idx_hvg = [idx for idx in class_idx if np.any(gene_fea[idx, hvg_genes] > 0)]
+        actual_hvg_ratio = len(class_idx_hvg) / len(class_idx)
+
+        # 记录实际的HVG比例
+        hvg_ratios[label] = actual_hvg_ratio
+
+        # 如果实际HVG比例低于anchor_ratio，提示用户并记录
+        if actual_hvg_ratio < anchor_ratio:
+            print(f"Label {label}: Using actual HVG ratio ({actual_hvg_ratio:.4f}) instead of anchor_ratio ({anchor_ratio})")
+            num_anchors_to_select = int(len(class_idx_hvg) * actual_hvg_ratio)
+        else:
+            num_anchors_to_select = int(len(class_idx_hvg) * anchor_ratio)
+
+        # 保存HVG记录
+        label_hvg_df = pd.DataFrame({
+            'label': [label] * len(class_idx_hvg),
+            'hvg_index': class_idx_hvg
+        })
+        label_hvg_df.to_csv(os.path.join(base_path, f'hvg_record_label_{label}.csv'), index=False)
+
+        # 随机选择anchors
+        if len(class_idx_hvg) > 0 and num_anchors_to_select > 0:
+            selected_anchors = np.random.choice(class_idx_hvg, size=num_anchors_to_select, replace=False)
+        else:
+            continue  # 如果没有合适的HVG，则跳过该标签
+
+        for anchor in selected_anchors:
+            # 计算与锚点距离最远的top_k个同类节点
+            anchor_loc = np.array([spatial_loc[0][anchor], spatial_loc[1][anchor]])
+            same_class_idx = np.array([idx for idx in range(len(labels)) if labels[idx] == label and idx != anchor])
+            same_class_loc = np.array([[spatial_loc[0][idx], spatial_loc[1][idx]] for idx in same_class_idx])
+
+            distances = np.linalg.norm(same_class_loc - anchor_loc, axis=1)
+            top_k_distant_idx = same_class_idx[np.argsort(distances)[-top_k:]]
+
+            # 筛选包含HVG的样本作为正样本候选
+            top_k_distant_hvg_idx = [idx for idx in top_k_distant_idx if np.any(gene_fea[idx, hvg_genes] > 0)]
+            if len(top_k_distant_hvg_idx) > 0:
+                # 选择基因表达最相似的节点作为正样本
+                anchor_hvg_expression = gene_fea[anchor, hvg_genes]
+                candidate_hvg_expression = gene_fea[top_k_distant_hvg_idx][:, hvg_genes]
+                similarities = np.dot(candidate_hvg_expression, anchor_hvg_expression)
+                positive_idx = top_k_distant_hvg_idx[np.argmax(similarities)]
+            else:
+                continue
+
+            # 找到离正样本最近的异类节点，且基因表达最相似但不包含HVG的节点作为负样本
+            positive_loc = np.array([spatial_loc[0][positive_idx], spatial_loc[1][positive_idx]])
+            different_class_idx = np.array([idx for idx in range(len(labels)) if labels[idx] != label])
+            different_class_loc = np.array([[spatial_loc[0][idx], spatial_loc[1][idx]] for idx in different_class_idx])
+
+            distances_to_positive = np.linalg.norm(different_class_loc - positive_loc, axis=1)
+            closest_negative_candidates = different_class_idx[np.argsort(distances_to_positive)[:top_k]]
+
+            # 排除HVG基因，选择基因表达最相似的节点作为负样本
+            hvg_mask = np.ones(gene_fea.shape[1], dtype=bool)
+            hvg_mask[hvg_genes] = False
+            anchor_non_hvg_expression = gene_fea[anchor, hvg_mask]
+            candidate_non_hvg_expression = gene_fea[closest_negative_candidates][:, hvg_mask]
+            similarities = np.dot(candidate_non_hvg_expression, anchor_non_hvg_expression)
+            negative_idx = closest_negative_candidates[np.argmax(similarities)]
+
+            # 记录结果
+            anchors.append(anchor)
+            positives.append(positive_idx)
+            negatives.append(negative_idx)
+
+    # Step 4: 保存数据
+    # 创建目录
+    Path(base_path).mkdir(parents=True, exist_ok=True)
+
+    # 保存完整的样本数据，包含空间坐标
+    df = pd.DataFrame({
+        'cell_type': labels,
+        'x': spatial_loc[0],
+        'y': spatial_loc[1],
+        'selected': ['labeled' if i in labeled_idx else 'unlabeled' for i in range(len(labels))],
+    })
+    df.to_csv(all_samples_path, index=False)
+
+    # 保存包含空间坐标的三元组数据
+    apn_df = pd.DataFrame({
+        'anchor': anchors,
+        'anchor_x': spatial_loc[0][anchors],
+        'anchor_y': spatial_loc[1][anchors],
+        'positive': positives,
+        'positive_x': spatial_loc[0][positives],
+        'positive_y': spatial_loc[1][positives],
+        'negative': negatives,
+        'negative_x': spatial_loc[0][negatives],
+        'negative_y': spatial_loc[1][negatives],
+    })
+    apn_df.to_csv(anchor_positive_negative_path, index=False)
+
+    # 返回结果
+    return labeled_idx, unlabeled_idx, anchors, positives, negatives
