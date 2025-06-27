@@ -56,8 +56,6 @@ class TripletTransformerNetwork(nn.Module):
         self.loss = nn.CrossEntropyLoss()
         self.triplet_loss = nn.TripletMarginLoss(margin=self.margin)
 
-        # ===== NIH模块新增 START =====
-        # NIH模块，使用纯Transformer结构
         self.nih_layers = nn.ModuleList()
         for _ in range(n_layers):
             self.nih_layers.append(
@@ -67,7 +65,6 @@ class TripletTransformerNetwork(nn.Module):
         self.nih_bns.append(nn.LayerNorm(self.hidden_dim))
         for _ in range(n_layers):
             self.nih_bns.append(nn.LayerNorm(self.hidden_dim))
-        # ===== NIH模块新增 END =====
 
         for i in range(n_layers):
             self.transformer_encoder.append(
@@ -81,12 +78,10 @@ class TripletTransformerNetwork(nn.Module):
             bn.reset_parameters()
         for fc in self.fcs:
             fc.reset_parameters()
-        # ===== NIH模块新增 START =====
         for nih_layer in self.nih_layers:
             nih_layer.reset_parameters()
         for bn in self.nih_bns:
             bn.reset_parameters()
-        # ===== NIH模块新增 END =====
 
     def forward(self, x, spatial_locs):
         """
@@ -117,26 +112,20 @@ class TripletTransformerNetwork(nn.Module):
 
             layer_.append(z)
             attn_.append(attn)
-
-        # ===== NIH模块新增 START =====
-        # NIH模块额外计算
         nih_layer_ = []
         nih_z = z
         nih_z = self.nih_bns[0](nih_z)
+        for nih_layer in self.nih_layers:
+            nih_layer.self_attention.history = None
         for i, nih_layer in enumerate(self.nih_layers):
             nih_z, _ = nih_layer(nih_z, spatial_locs)
-            nih_z += nih_layer_[i-1] if i > 0 else nih_z  # 残差连接
-            nih_z = self.nih_bns[i+1](nih_z)
+            nih_z += nih_layer_[i - 1] if i > 0 else nih_z 
+            nih_z = self.nih_bns[i + 1](nih_z)
             nih_z = self.activation(nih_z)
             nih_z = F.dropout(nih_z, p=self.dropout_rate, training=self.training)
             nih_layer_.append(nih_z)
 
-        # 融合 NIH 输出和主输出（你可以根据需求调整融合策略）
         z = z + nih_z
-        # ===== NIH模块新增 END =====
-
-        # 使用 jumping knowledge 进行信息传递
-        # z = torch.cat(layer_, dim=-1)
 
         x_out = self.fcs[-1](z)
 
@@ -163,12 +152,126 @@ class FeedForwardNetwork(nn.Module):
         self.layer1 = nn.Linear(hidden_size, ffn_size)
         self.gelu = nn.GELU()
         self.layer2 = nn.Linear(ffn_size, hidden_size)
+        self.dropout = nn.Dropout(dropout_rate)
 
     def forward(self, x):
         x = self.layer1(x)
         x = self.gelu(x)
+        x = self.dropout(x)
         x = self.layer2(x)
+        x = self.dropout(x)
         return x
+
+
+class NIHMultiHeadAttention(nn.Module):
+    """
+    NIH Multi-Head Attention layer with cross-layer attention history accumulation.
+    """
+
+    def __init__(self, hidden_size, output_size, num_heads, dropout=0.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.output_size = output_size
+        self.hidden_size = hidden_size
+        self.dropout = nn.Dropout(dropout)
+
+        self.Wq = nn.Linear(hidden_size, num_heads * output_size)
+        self.Wk = nn.Linear(hidden_size, num_heads * output_size)
+        self.Wv = nn.Linear(hidden_size, num_heads * output_size)
+        self.Wo = nn.Linear(num_heads * output_size, output_size)
+
+        # Learnable scalar beta controlling the strength of history influence
+        self.beta = nn.Parameter(torch.tensor(0.1))
+
+        # attention history buffer, shape: [num_heads, N, N]
+        self.register_buffer("history", None)
+
+    def reset_parameters(self):
+        self.Wq.reset_parameters()
+        self.Wk.reset_parameters()
+        self.Wv.reset_parameters()
+        self.Wo.reset_parameters()
+        nn.init.constant_(self.beta, 0.1)
+        self.history = None
+
+    def forward(self, x, spatial_locs=None):
+        """
+        x: [N, hidden_size]
+        spatial_locs: unused here but keep for interface compatibility
+        """
+        N = x.size(0)
+
+        # Compute Q,K,V
+        Q = self.Wq(x).view(N, self.num_heads, self.output_size).permute(1, 0, 2)  # [num_heads, N, output_size]
+        K = self.Wk(x).view(N, self.num_heads, self.output_size).permute(1, 0, 2)  # [num_heads, N, output_size]
+        V = self.Wv(x).view(N, self.num_heads, self.output_size).permute(1, 0, 2)  # [num_heads, N, output_size]
+
+        # Scaled dot-product attention score
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.output_size)  # [num_heads, N, N]
+
+        # Initialize history if None or shape mismatch
+        if self.history is None or self.history.size(1) != N or self.history.size(2) != N:
+            self.history = torch.zeros_like(scores)
+
+        # Add weighted cumulative history to current attention scores
+        scores = scores + self.beta * self.history
+
+        # Softmax to get attention weights
+        attn_weights = torch.softmax(scores, dim=-1)
+
+        # Update history by accumulating current attention weights (detach to prevent backprop through history)
+        self.history = self.history + attn_weights.detach()
+
+        # Attention output
+        out = torch.matmul(attn_weights, V)  # [num_heads, N, output_size]
+
+        # Concatenate heads
+        out = out.permute(1, 0, 2).contiguous().view(N, -1)  # [N, num_heads * output_size]
+
+        out = self.Wo(out)  # [N, output_size]
+        out = self.dropout(out)
+
+        return out, attn_weights
+
+
+class NIHEncoderLayer(nn.Module):
+    """
+    NIH Transformer Encoder Layer with cross-layer neighbor interaction history.
+
+    Implements:
+    - Multi-head attention with history accumulation,
+    - Residual connections,
+    - LayerNorm,
+    - FeedForward network.
+    """
+
+    def __init__(self, hidden_size, output_size, num_heads=8, dropout=0.0):
+        super().__init__()
+        self.self_attention = NIHMultiHeadAttention(hidden_size, output_size, num_heads, dropout)
+        self.norm1 = nn.LayerNorm(output_size)
+        self.ffn = FeedForwardNetwork(output_size, output_size * 2, dropout)
+        self.norm2 = nn.LayerNorm(output_size)
+        self.dropout = nn.Dropout(dropout)
+
+    def reset_parameters(self):
+        self.self_attention.reset_parameters()
+        self.norm1.reset_parameters()
+        self.norm2.reset_parameters()
+        self.ffn.layer1.reset_parameters()
+        self.ffn.layer2.reset_parameters()
+
+    def forward(self, x, spatial_locs=None):
+        # Multi-head self-attention with history bias
+        attn_out, attn_weights = self.self_attention(x, spatial_locs)
+        x = x + self.dropout(attn_out)
+        x = self.norm1(x)
+
+        # FeedForward network
+        ffn_out = self.ffn(x)
+        x = x + self.dropout(ffn_out)
+        x = self.norm2(x)
+
+        return x, attn_weights
 
 
 class MultiHeadAttention(nn.Module):
@@ -269,38 +372,6 @@ class EncoderLayer(nn.Module):
         return x, attn
 
 
-class NIHEncoderLayer(nn.Module):
-    """
-    NIH 模块的单层Transformer编码器（纯Transformer结构）。
-    """
-
-    def __init__(self, hidden_size, output_size, num_heads=8, dropout=0.0):
-        super(NIHEncoderLayer, self).__init__()
-        self.self_attention = MultiHeadAttention(hidden_size, output_size, num_heads)
-        self.norm1 = nn.LayerNorm(output_size)
-        self.ffn = FeedForwardNetwork(output_size, output_size * 2, dropout)
-        self.norm2 = nn.LayerNorm(output_size)
-        self.dropout = nn.Dropout(dropout)
-
-    def reset_parameters(self):
-        self.self_attention.reset_parameters()
-        self.norm1.reset_parameters()
-        self.norm2.reset_parameters()
-        self.ffn.layer1.reset_parameters()
-        self.ffn.layer2.reset_parameters()
-
-    def forward(self, x, spatial_locs):
-        attn_out, _ = self.self_attention(x, spatial_locs)
-        x = x + self.dropout(attn_out)
-        x = self.norm1(x)
-
-        ffn_out = self.ffn(x)
-        x = x + self.dropout(ffn_out)
-        x = self.norm2(x)
-
-        return x, None
-
-
 class GraphRDBias(nn.Module):
     """
     Compute 3D attention bias (for multi-head attention) for a single graph according to the position information for each head.
@@ -386,7 +457,7 @@ class NonLinear(nn.Module):
         self.activation = nn.ReLU()
 
     def forward(self, x):
-        return self.activation(self.linear(x))    #未用掩码机制
+        return self.activation(self.linear(x)) 
 
 
 
