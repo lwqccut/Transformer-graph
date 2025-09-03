@@ -1,9 +1,11 @@
-- Python 3.10
--Dependencies:
--pandas 1.1.1
--biopython 1.78
--numpy 1.19
--tensorflow 2.4
--cuda:12.1
--pytorch:2.4
--GPU: NVIDIA A100 (32GB VRAM)
+
+## Requirements
+Dependencies:
+Python 3.10<br>
+pandas 1.1.1<br>
+biopython 1.78<br>
+numpy 1.19<br>
+tensorflow 2.4<br>
+cuda:12.1<br>
+pytorch:2.4<br>
+GPU: NVIDIA A100 (32GB VRAM)<br>
