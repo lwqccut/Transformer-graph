@@ -6,3 +6,4 @@ numpy 1.19
 tensorflow 2.4
 cuda:12.1
 pytorch:2.4
+GPU: NVIDIA A100 (32GB VRAM)
