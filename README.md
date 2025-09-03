@@ -1,6 +1,5 @@
 
 ## Requirements
-Dependencies:
 Python 3.10<br>
 pandas 1.1.1<br>
 biopython 1.78<br>
