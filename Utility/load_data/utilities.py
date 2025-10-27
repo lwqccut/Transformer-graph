@@ -208,6 +208,35 @@ def load_train_data(id='151673', knn=7, data_path='/root/GMAE/DLPFC', margin=25,
     return RNA_emb, spatial_loc, gt, labeled_idx, unlabeled_idx, anchors, positives, negatives
 
 
+    elif dataset == 'MERFISH-Liver-Filt':
+        RNA_emb, gt, spatial_loc, labeled_idx, unlabeled_idx, anchors, positives, negatives = \
+            load_MERFISH_Liver_Filt(
+                id,
+                labeled_ratio=lbr,
+                anchor_ratio=anc,
+                split_mode=split_model,
+                margin=margin,
+                root_path=data_path,
+                dataset_name='MERFISH-Liver-Filt',
+                save_root='../../SC'
+            )
+        spatial_loc = np.array(spatial_loc).astype(float)
+    elif dataset == 'MERFISH-Liver-Proc':
+    RNA_emb, gt, spatial_loc, labeled_idx, unlabeled_idx, anchors, positives, negatives = \
+        load_MERFISH_Liver_Proc(
+            id,
+            labeled_ratio=lbr,
+            anchor_ratio=anc,
+            split_mode=split_model,
+            margin=margin,
+            root_path=data_path,
+            dataset_name='MERFISH-Liver-Proc',
+            save_root='../../SC'
+        )
+    spatial_loc = np.array(spatial_loc).astype(float)
+
+
+
 # def load_train_data(id='151673', knn=7, data_path='/root/GMAE/DLPFC', img_path='./', margin=25, metric='cosine',
 #                     dim_RNA=3000, dataset='DLPFC', labeled_flag='labeled', lbr=0.3, split_model='disjoint',
 #                     add_img_pos=True,
