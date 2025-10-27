@@ -1,0 +1,329 @@
+import os
+import numpy as np
+import pandas as pd
+import scanpy as sc
+from pathlib import Path
+from sklearn.model_selection import train_test_split
+
+############################################
+# 通用的划分函数：和 split_labeled_data 基本一致，
+# 只是把保存路径从死写 ../../SC/Nanostring/ 改成根据 dataset_name 来放
+# （保持 labeled_idx / unlabeled_idx / anchors / positives / negatives 的含义一致）:contentReference[oaicite:3]{index=3}
+############################################
+def split_labeled_data_general(
+    gene_fea,
+    labels,
+    spatial_loc,
+    labeled_ratio=0.3,
+    anchor_ratio=0.1,
+    fov=1,
+    seed=1024,
+    split_mode='disjoint',
+    top_k=20,
+    dataset_name='MERFISH-Liver-Filt',
+    save_root='../../SC'
+):
+    """
+    根据给定的 labeled_ratio / anchor_ratio / split_mode
+    生成:
+      - labeled_idx / unlabeled_idx
+      - triplet 采样的 anchors / positives / negatives
+    并把这些索引保存到
+      {save_root}/{dataset_name}/Samples/split_model_.../fov_{fov}/
+    下，和原始 split_labeled_data 的行为保持一致。:contentReference[oaicite:4]{index=4}
+    """
+
+    import random
+    np.random.seed(seed)
+    random.seed(seed)
+
+    # === 生成输出目录 ===
+    base_path = os.path.join(
+        save_root,
+        dataset_name,
+        'Samples',
+        'split_model_{}_ldr_{}_anc_{}_seed_{}'.format(split_mode, labeled_ratio, anchor_ratio, seed),
+        'fov_' + str(fov)
+    )
+    all_samples_path = os.path.join(base_path, 'selected_samples_all.csv')
+    anchor_positive_negative_path = os.path.join(base_path, 'triplet_indices.csv')
+
+    # === 如果已经切过同一个 FOV 的划分，则直接复用，避免重复随机划分 ===
+    if os.path.exists(all_samples_path) and os.path.isfile(anchor_positive_negative_path):
+        df = pd.read_csv(all_samples_path)
+        labeled_idx = df[df['selected'] == 'labeled'].index.tolist()
+        unlabeled_idx = df[df['selected'] == 'unlabeled'].index.tolist()
+
+        apn_df = pd.read_csv(anchor_positive_negative_path)
+        anchors = apn_df['anchor'].tolist()
+        positives = apn_df['positive'].tolist()
+        negatives = apn_df['negative'].tolist()
+
+        return labeled_idx, unlabeled_idx, anchors, positives, negatives
+
+    # === 构造空间网格 gt，和原始 split_labeled_data 一致 ===
+    # 注意：原始代码对 labels 做了 +1 偏移（label 从1开始）:contentReference[oaicite:5]{index=5}
+    labels = labels + 1
+
+    x_coords = spatial_loc[0]
+    y_coords = spatial_loc[1]
+
+    x_max = np.nan_to_num(x_coords.max() + 1, nan=0)
+    y_max = np.nan_to_num(y_coords.max() + 1, nan=0)
+    gt = -1 * np.ones((int(x_max), int(y_max)), dtype=int)
+
+    for idx, (xx, yy) in enumerate(zip(x_coords, y_coords)):
+        gt[int(xx), int(yy)] = labels[idx]
+
+    unique_labels = np.unique(labels)
+
+    labeled_idx, unlabeled_idx = [], []
+
+    if split_mode == 'random':
+        # 随机分割：对每个类别，按 labeled_ratio 抽一部分细胞做 labeled
+        for label in unique_labels:
+            mask_xy = np.where(gt == label)
+            coords_list = list(zip(*mask_xy))  # [(x1,y1),(x2,y2),...]
+
+            # train/test=标注/未标注
+            train_coords, test_coords = train_test_split(
+                coords_list,
+                train_size=labeled_ratio,
+                random_state=seed
+            )
+
+            # 用网格再标一遍，和原始实现保持一致
+            train_gt = np.zeros_like(gt)
+            test_gt = np.zeros_like(gt)
+
+            if len(train_coords) > 0:
+                xs, ys = zip(*train_coords)
+                train_gt[xs, ys] = gt[xs, ys]
+            if len(test_coords) > 0:
+                xs, ys = zip(*test_coords)
+                test_gt[xs, ys] = gt[xs, ys]
+
+            for idx_cell, (xx, yy) in enumerate(zip(x_coords, y_coords)):
+                if train_gt[int(xx), int(yy)] != 0:
+                    labeled_idx.append(idx_cell)
+                elif test_gt[int(xx), int(yy)] != 0:
+                    unlabeled_idx.append(idx_cell)
+
+    elif split_mode == 'disjoint':
+        # 空间剥离式划分：尽量把 labeled / unlabeled 放在空间上分离的区域:contentReference[oaicite:6]{index=6}
+        train_gt = np.copy(gt)
+        test_gt = np.copy(gt)
+        for label in unique_labels:
+            mask_label = (gt == label)
+            # 找一个按行切分的位置，使上下两块的比例 ~ labeled_ratio
+            for cut_x in range(gt.shape[0]):
+                first_half = np.count_nonzero(mask_label[:cut_x, :])
+                second_half = np.count_nonzero(mask_label[cut_x:, :])
+                try:
+                    ratio = first_half / second_half
+                    if 0.9 * labeled_ratio < ratio < 1.1 * labeled_ratio:
+                        break
+                except ZeroDivisionError:
+                    continue
+            # 上半块设为 unlabeled
+            mask_label[:cut_x, :] = 0
+            train_gt[mask_label] = 0
+
+        test_gt[train_gt > 0] = 0
+
+        for idx_cell, (xx, yy) in enumerate(zip(x_coords, y_coords)):
+            if train_gt[int(xx), int(yy)] != 0:
+                labeled_idx.append(idx_cell)
+            elif test_gt[int(xx), int(yy)] != 0:
+                unlabeled_idx.append(idx_cell)
+
+    else:
+        raise ValueError(f"{split_mode} sampling is not implemented yet.")
+
+    # === 生成 triplet anchors / positives / negatives，逻辑照抄原函数 ===:contentReference[oaicite:7]{index=7}
+    anchors, positives, negatives = [], [], []
+    unique_labeled_classes = np.unique(labels[labeled_idx])
+
+    for label in unique_labeled_classes:
+        labeled_idx_arr = np.array(labeled_idx)
+        class_idx = labeled_idx_arr[labels[labeled_idx] == label]
+
+        num_anchors_to_select = int(len(class_idx) * anchor_ratio)
+        if num_anchors_to_select < 1 and len(class_idx) > 0:
+            num_anchors_to_select = 1
+        selected_anchors = np.random.choice(
+            class_idx,
+            size=num_anchors_to_select,
+            replace=False
+        )
+
+        for anchor in selected_anchors:
+            # 取同类里空间最远的 top_k
+            anchor_loc = np.array([x_coords[anchor], y_coords[anchor]])
+            same_class_idx = np.array([idx_i for idx_i in range(len(labels))
+                                       if labels[idx_i] == label and idx_i != anchor])
+            same_class_loc = np.array([[x_coords[idx_i], y_coords[idx_i]] for idx_i in same_class_idx])
+
+            if len(same_class_idx) == 0:
+                continue
+
+            d_same = np.linalg.norm(same_class_loc - anchor_loc, axis=1)
+            top_k_idx = same_class_idx[np.argsort(d_same)[-top_k:]]
+
+            # 从 top_k_idx 中挑表达最相似的正样本
+            sim_pos = np.dot(gene_fea[top_k_idx], gene_fea[anchor])
+            positive_idx = top_k_idx[np.argmax(sim_pos)]
+
+            # 找负样本：离 positive 最近但不同类
+            positive_loc = np.array([x_coords[positive_idx], y_coords[positive_idx]])
+            diff_class_idx = np.array([idx_i for idx_i in range(len(labels))
+                                       if labels[idx_i] != label])
+            diff_class_loc = np.array([[x_coords[idx_i], y_coords[idx_i]] for idx_i in diff_class_idx])
+
+            if len(diff_class_idx) == 0:
+                continue
+
+            d_diff = np.linalg.norm(diff_class_loc - positive_loc, axis=1)
+            nearest_neg_candidates = diff_class_idx[np.argsort(d_diff)[:top_k]]
+            sim_neg = np.dot(gene_fea[nearest_neg_candidates], gene_fea[anchor])
+            negative_idx = nearest_neg_candidates[np.argmax(sim_neg)]
+
+            anchors.append(anchor)
+            positives.append(positive_idx)
+            negatives.append(negative_idx)
+
+    # === 保存划分记录，和原split_labeled_data保持相同格式 ===:contentReference[oaicite:8]{index=8}
+    Path(base_path).mkdir(parents=True, exist_ok=True)
+
+    df = pd.DataFrame({
+        'cell_type': labels,
+        'x': x_coords,
+        'y': y_coords,
+        'selected': ['labeled' if i in labeled_idx else 'unlabeled'
+                     for i in range(len(labels))]
+    })
+    df.to_csv(all_samples_path, index=False)
+
+    # 每个类单独保存
+    for this_label in np.unique(labels):
+        df[df['cell_type'] == this_label].to_csv(
+            os.path.join(base_path, f'selected_samples_label_{this_label}.csv'),
+            index=False
+        )
+
+    apn_df = pd.DataFrame({
+        'anchor': anchors,
+        'positive': positives,
+        'negative': negatives
+    })
+    apn_df.to_csv(anchor_positive_negative_path, index=False)
+
+    return labeled_idx, unlabeled_idx, anchors, positives, negatives
+
+
+############################################
+# MERFISH-Liver-Filt 数据提取主函数
+# 设计完全对齐 load_Nano_data 的接口和返回值顺序，
+# 这样可以直接塞进 load_train_data 里作为一个新分支。:contentReference[oaicite:9]{index=9} :contentReference[oaicite:10]{index=10}
+############################################
+def load_MERFISH_Liver_Filt(
+    id,
+    labeled_ratio=0.3,
+    anchor_ratio=0.1,
+    split_mode='disjoint',
+    margin=16,
+    root_path='./',
+    h5ad_name='MsLiver_Cellbound_VZG116_V1_JH_09-18-2021_FilteredSingleCellCounts.h5ad',
+    dataset_name='MERFISH-Liver-Filt',
+    save_root='../../SC'
+):
+    """
+    参数:
+        id: 视野/区域的 fov ID（和 Nanostring 的 fov 用法一致）
+        labeled_ratio: 标注比例, 对齐 args.lbr:contentReference[oaicite:11]{index=11}
+        anchor_ratio: 锚点比例, 对齐 args.anc:contentReference[oaicite:12]{index=12}
+        split_mode: 'disjoint' 或 'random'，对齐 args.sm:contentReference[oaicite:13]{index=13}
+        margin: 保留该参数以保持签名一致，MERFISH 这里不裁图，可以忽略
+        root_path: 数据所在目录
+        h5ad_name: 过滤版肝脏数据文件名
+        dataset_name: 用于保存划分索引的子目录名
+        save_root: 划分结果(csv)的根目录
+
+    返回:
+        gene_fea: (N_cells, N_genes) 的表达矩阵 (float)
+        gt:       (N_cells,) 的整数标签
+        spatial_loc: (N_cells, 2) 细胞坐标
+        labeled_idx, unlabeled_idx, anchors, positives, negatives: 半监督/三元组划分索引
+    """
+
+    # 1. 读取 h5ad
+    adata_path = os.path.join(root_path, h5ad_name)
+    adata = sc.read_h5ad(adata_path)
+
+    # 2. 选中指定 fov
+    #    注意：id 传进来应该能匹配 obs['fov']，是一个视野编号
+    sub = adata[adata.obs['fov'] == id].copy()
+
+    # 3. 基因表达特征
+    #    adata.X 可能是稀疏矩阵，需要转成 dense float
+    if hasattr(sub.X, "toarray"):
+        gene_fea = sub.X.toarray().astype(float)
+    else:
+        gene_fea = np.array(sub.X).astype(float)
+
+    # 4. 空间坐标
+    #    注意下游 split_* 里把坐标当作栅格索引来用，所以先四舍五入并转 int
+    x = np.round(sub.obs['center_x'].to_numpy()).astype(int)
+    y = np.round(sub.obs['center_y'].to_numpy()).astype(int)
+
+    # 保存原始 (x,y) 形式给 split，后面再拼成 (N,2)
+    spatial_loc_list = [x, y]
+
+    # 5. 细胞类型标签
+    #    自动找一个像细胞类型的列
+    candidate_cols = [
+        'cell_type', 'Cell_type', 'celltype',
+        'cell_class', 'Cell_class',
+        'annotation', 'Annotation',
+        'cluster', 'Cluster', 'label', 'Label'
+    ]
+    ct_col = None
+    for c in candidate_cols:
+        if c in sub.obs.columns:
+            ct_col = c
+            break
+    if ct_col is None:
+        raise RuntimeError(
+            f"Cannot find a cell type column in obs. "
+            f"Checked: {candidate_cols}, got columns {list(sub.obs.columns)}"
+        )
+
+    # 像 load_Nano_data 的 label_map 一样，把字符串标签编码成整数0,1,2,...:contentReference[oaicite:14]{index=14}
+    unique_types = pd.Categorical(sub.obs[ct_col]).categories.tolist()
+    label_map = {t:i for i,t in enumerate(unique_types)}
+    gt = sub.obs[ct_col].map(label_map).to_numpy()
+
+    # 6. 根据空间+标签划分 labeled/unlabeled/anchors/...（复用上面的一般化版本）
+    labeled_idx, unlabeled_idx, anchors, positives, negatives = split_labeled_data_general(
+        gene_fea,
+        gt,
+        spatial_loc_list,
+        labeled_ratio=labeled_ratio,
+        anchor_ratio=anchor_ratio,
+        fov=id,
+        seed=42,
+        split_mode=split_mode,
+        top_k=20,
+        dataset_name=dataset_name,
+        save_root=save_root
+    )
+
+    # 7. 把坐标堆成 (N,2) 矩阵，和 load_Nano_data 的最终返回保持一致:contentReference[oaicite:15]{index=15}
+    spatial_loc = np.column_stack((x, y)).astype(float)
+
+    # 打印信息，和 load_Nano_data 的风格一致:contentReference[oaicite:16]{index=16}
+    print(f"[{dataset_name} | fov {id}] #cells: {len(gt)}")
+    print(f"labeled: {len(labeled_idx)}, unlabeled: {len(unlabeled_idx)}")
+    print(f"anchors: {len(anchors)}, positives: {len(positives)}, negatives: {len(negatives)}")
+
+    return gene_fea, gt, spatial_loc, labeled_idx, unlabeled_idx, anchors, positives, negatives
