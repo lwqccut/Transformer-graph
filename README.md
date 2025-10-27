@@ -17,4 +17,8 @@ scanpy==1.9.1<br>
 scipy==1.8.1<br>
 scikit_learn==1.1.1<br>
 torch_geometric==2.0.4<br>
-GPU:NVIDIA A100 (32GB VRAM)<br>
+GPU:L40S-48G <br>
+
+The default parameter setting is 1000 rounds, with a training time of approximately 3 minutes per 1000 rounds.
+
+
