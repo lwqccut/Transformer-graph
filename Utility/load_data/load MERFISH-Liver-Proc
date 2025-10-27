@@ -1,0 +1,104 @@
+import os
+import numpy as np
+import pandas as pd
+import scanpy as sc
+
+def load_MERFISH_Liver_Proc(
+    id,
+    labeled_ratio=0.3,
+    anchor_ratio=0.1,
+    split_mode='disjoint',
+    margin=16,
+    root_path='./',
+    h5ad_name='MsLiver_Cellbound_VZG116_V1_JH_09-18-2021_ProcessedSingleCellCounts.h5ad',
+    dataset_name='MERFISH-Liver-Proc',
+    save_root='../../SC'
+):
+    """
+    加载 MERFISH-Liver-Proc (ProcessedSingleCellCounts) 指定 fov 的数据并做半监督/三元组划分。
+
+    参数
+    ----
+    id : 视野编号，对应 obs['fov'] 中的某个值；等价于你 Nanostring 里的 fov id。
+    labeled_ratio : 已标注比例 (和 args.lbr 对齐)
+    anchor_ratio : anchor 节点比例 (和 args.anc 对齐)
+    split_mode : 'disjoint' 或 'random' (和 args.sm 对齐)
+    margin : 与 Nanostring 加载函数保持签名一致，这里不影响子集选择
+    root_path : h5ad 文件所在目录
+    h5ad_name : ProcessedSingleCellCounts.h5ad 文件名
+    dataset_name : 用于在 save_root 下建结果目录，比如 'MERFISH-Liver-Proc'
+    save_root : 半监督划分和 triplet 索引保存的根目录，比如 '../../SC'
+
+    返回
+    ----
+    gene_fea : (N_cells, N_genes) float32/float64，当前 fov 的表达矩阵
+    gt : (N_cells,) int，细胞类型标签（从0开始编码）
+    spatial_loc : (N_cells, 2) float，(x,y) 坐标
+    labeled_idx : list[int]，被当成有标签的细胞索引
+    unlabeled_idx : list[int]，被当成无标签的细胞索引
+    anchors, positives, negatives : list[int]，三元组约束的索引
+    """
+
+    # 1. 读全量 processed 版肝脏数据
+    adata_path = os.path.join(root_path, h5ad_name)
+    adata = sc.read_h5ad(adata_path)
+
+    # 2. 取指定 fov
+    sub = adata[adata.obs['fov'] == id].copy()
+
+    # 3. 基因表达矩阵 (N_cells, N_genes)
+    if hasattr(sub.X, "toarray"):
+        gene_fea = sub.X.toarray().astype(float)
+    else:
+        gene_fea = np.array(sub.X).astype(float)
+
+    # 4. 空间坐标，和滤波版保持一致：用 center_x/center_y，取整方便后续网格化切分
+    x = np.round(sub.obs['center_x'].to_numpy()).astype(int)
+    y = np.round(sub.obs['center_y'].to_numpy()).astype(int)
+    spatial_loc_list = [x, y]  # 传给 split_labeled_data_general
+    spatial_loc = np.column_stack((x, y)).astype(float)  # (N,2) 作为最终返回
+
+    # 5. 细胞类型列 -> 数字标签
+    #    逻辑同 Filt 版：找 obs 里最可能是细胞类型注释的列，然后做 label_map -> int
+    candidate_cols = [
+        'cell_type', 'Cell_type', 'celltype',
+        'cell_class', 'Cell_class',
+        'annotation', 'Annotation',
+        'cluster', 'Cluster', 'label', 'Label'
+    ]
+    ct_col = None
+    for c in candidate_cols:
+        if c in sub.obs.columns:
+            ct_col = c
+            break
+    if ct_col is None:
+        raise RuntimeError(
+            f"[{dataset_name}] cannot find a usable cell-type column in obs. "
+            f"Checked {candidate_cols}, got {list(sub.obs.columns)}"
+        )
+
+    unique_types = pd.Categorical(sub.obs[ct_col]).categories.tolist()
+    label_map = {t: i for i, t in enumerate(unique_types)}
+    gt = sub.obs[ct_col].map(label_map).to_numpy()
+
+    # 6. 调用通用划分：labeled / unlabeled / anchors / positives / negatives
+    labeled_idx, unlabeled_idx, anchors, positives, negatives = split_labeled_data_general(
+        gene_fea=gene_fea,
+        labels=gt,
+        spatial_loc=spatial_loc_list,
+        labeled_ratio=labeled_ratio,
+        anchor_ratio=anchor_ratio,
+        fov=id,
+        seed=42,
+        split_mode=split_mode,
+        top_k=20,
+        dataset_name=dataset_name,
+        save_root=save_root
+    )
+
+    # 7. 打印信息，方便日志对齐 Nanostring
+    print(f"[{dataset_name} | fov {id}] #cells: {len(gt)}")
+    print(f"labeled: {len(labeled_idx)}, unlabeled: {len(unlabeled_idx)}")
+    print(f"anchors: {len(anchors)}, positives: {len(positives)}, negatives: {len(negatives)}")
+
+    return gene_fea, gt, spatial_loc, labeled_idx, unlabeled_idx, anchors, positives, negatives
