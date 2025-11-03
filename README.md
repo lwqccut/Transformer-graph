@@ -21,4 +21,5 @@ GPU:L40S-48G <br>
 
 The default parameter setting is 1000 rounds, with a training time of approximately 3 minutes per 1000 rounds.
 
+After loading the dataset, run file train_1_fov.py for training.
 
