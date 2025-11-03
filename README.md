@@ -20,6 +20,6 @@ torch_geometric==2.0.4<br>
 GPU:L40S-48G <br>
 
 The default parameter setting is 1000 rounds, with a training time of approximately 3 minutes per 1000 rounds.
-
-After loading the dataset, run file train_1_fov.py for training.
+Please select the required dataset, modify it in file Utility/load, and align the path and name in subsequent files.
+After loading the dataset, run file train_one_fov.py for training.
 
